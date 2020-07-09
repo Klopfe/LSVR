@@ -1,6 +1,6 @@
 import numpy as np
 import warnings
-
+from numba import njit
 
 """ The problem we seek to solve is the following quadratic optimization problem
 Given X, y, C, nu
@@ -26,6 +26,165 @@ C <- C hyperparameter of the Simplex nuSVR optimization problem, default value =
 nu <- nu hyperparameter of the Simplex nuSVR optimization problem, default value = 0.5
 max_it <- Threshold of the number of iterations of the algorithm, a warning pops if max_it is reached
 """
+
+def SMO_SSVR(X, y, C=1.0, nu=0.5, tol=1e-3, max_iter=1000, warm_start=None):
+    n_samples, n_features = X.shape
+# Initialization of theta in the feasible domain and number of iterations k
+    theta = np.zeros(2 * n_samples + n_features + 1)
+    if warm_start is None:
+        somme = (C * nu) / 2
+        for i in range(n_samples):
+            theta[i] = min(somme, C / n_samples)
+            theta[i+n_samples] = min(somme, C / n_samples)
+            somme = somme - theta[i]
+    else:
+        theta = warm_start
+
+# Initialization of beta using primal dual relationship
+    beta = - np.sum((
+                theta[0:n_samples] - theta[n_samples:(2 * n_samples)]) * X.T, axis=1)
+    beta += theta[(2 * n_samples):(2 * n_samples + n_features)]
+    beta -= np.repeat(theta[-1], n_features)
+    # Initialisation of the number of iterations
+
+    
+    F = np.zeros(2 * n_samples + n_features + 1)
+    Xbeta_y = X @ (- beta) + y
+    Xtalpha = - X.T @ (theta[0:n_samples] - theta[n_samples:(2 * n_samples)])
+    F[0:n_samples] = Xbeta_y
+    F[n_samples:(2 * n_samples)] =  - Xbeta_y
+    F[(2 * n_samples):(2 * n_samples + n_features)] = Xtalpha + theta[(2 * n_samples):(2 * n_samples + n_features)]
+    F[(2 * n_samples):(2 * n_samples + n_features)] -= np.repeat(theta[-1], n_features)
+    F[-1] =  np.sum(np.sum(X, axis=1) * (theta[0:n_samples] - theta[n_samples:(2 * n_samples)])) 
+    F[-1] +=  - np.sum(theta[(2 * n_samples):(2 * n_samples + n_features)]) + n_features * theta[-1] + 1.0
+# Lipschitz constant for coordinate update
+    L = np.linalg.norm(X, axis=1) ** 2
+
+    return CD_update_const_SVR(
+        X, y, beta, theta, F, L, C, nu, tol, max_iter, n_samples, n_features
+    )
+
+@njit
+def CD_update_const_SVR(X, y, beta, theta, F, L, C, nu, tol, max_iter, n_samples, n_features):
+    k = 0
+    delta = np.inf
+    sub =[]
+    deltas = []
+    while (delta > tol and k < max_iter):
+        # Checking optimality conditions defining the set of indices I_up, I_low, ...
+        I_up = np.arange(0, n_samples)[(theta[0:n_samples]) < (C / n_samples)]
+        I_low = np.arange(0, n_samples)[(theta[0:n_samples]) > 0]
+
+        I_up_star = np.arange(n_samples, 2 * n_samples)[theta[n_samples:(2 * n_samples)] < (C / n_samples)]
+        I_low_star = np.arange(n_samples, 2 * n_samples)[theta[n_samples:(2 * n_samples)] > 0]
+
+        i = I_up[np.argmin(F[I_up])]
+        j = I_low[np.argmax(F[I_low])]
+
+        i_star = I_up_star[np.argmin(F[I_up_star])]
+        j_star = I_low_star[np.argmax(F[I_low_star])]
+
+        # Optimality score for each block of variables
+        Delta1 = (F[j]-F[i])
+        Delta2 = (F[j_star]-F[i_star])
+        Delta3 = np.min(F[(2 * n_samples):(2 * n_samples + n_features)])
+        Delta3 = max(-Delta3, 0)
+        Delta4 = np.abs(F[(2 * n_samples + n_features)])
+        delta = np.max(np.array([Delta1, Delta2, Delta3, Delta4]))
+
+# Selecting the block in which the update will take place
+        ind = np.arange(0, 4)
+        mask = (np.array([Delta1, Delta2, Delta3, Delta4]) == delta)
+        case = ind[mask]
+        if case[0] == 0:
+            denom = (L[i]+L[j]- 2 * X[i, :] @ X[j, :].T)
+            num = F[i] - F[j]
+            theta2 = -num / denom
+# Performing clipping to make sure that we stay in feasible domain
+            A = max(-theta[i], theta[j] - C / n_samples)
+            B = min(theta[j], C / n_samples - theta[i])
+            t = min(max(A, theta2), B)
+# Updating the variables
+            theta_i_old = theta[i]
+            theta_j_old = theta[j]
+            theta[i] = theta[i] + t
+            theta[j] = theta[j] - t
+            beta_old = beta
+            beta -= (t * (X[i, :] - X[j, :])).flatten()
+
+#Update of the gradient F
+            temp = t * X @ (X[i, :] - X[j, :]).flatten()
+            F[0:n_samples] += temp
+            F[n_samples:(2 * n_samples)] -=  temp
+            F[(2 * n_samples):(2 * n_samples + n_features)] += (- (theta[i] - theta_i_old) * X[i, :] -  (theta[j] - theta_j_old) * X[j, :]).flatten()
+            F[-1] +=  np.sum(X[i, :]) * (theta[i] - theta_i_old) + np.sum(X[j, :]) * (theta[j] - theta_j_old)
+        elif case[0] == 1:
+            istar = i_star - n_samples
+            jstar = j_star - n_samples
+            denom = (L[istar]+L[jstar]-2 * X[istar, :] @ X[jstar, :].T)
+            num = F[i_star] - F[j_star]
+            theta2 = -num / denom
+# Performing clipping to make sure that we stay in feasible domain
+            A = max(-theta[i_star], theta[j_star] - C / n_samples)
+            B = min(theta[j_star], C / n_samples - theta[i_star])
+            t = min(max(A, theta2), B)
+# Updating the variables
+            theta_i_old = theta[i_star]
+            theta_j_old = theta[j_star]
+            theta[i_star] = theta[i_star] + t
+            theta[j_star] = theta[j_star] - t
+            beta += (t * (X[istar, :] - X[jstar, :])).flatten()
+#Update of the gradient F
+            temp = t * X @ (X[istar, :] - X[jstar, :]).flatten()
+            F[0:n_samples] -= temp
+            F[n_samples:(2 * n_samples)] +=  temp
+            F[(2 * n_samples):(2 * n_samples + n_features)] += ( (theta[i_star] - theta_i_old) * X[istar, :] + (theta[j_star] - theta_j_old) * X[jstar, :]).flatten()
+            F[-1] -=  np.sum(X[istar, :]) * (theta[i_star] - theta_i_old) + np.sum(X[jstar, :]) * (theta[j_star] - theta_j_old)
+  
+        elif case[0] == 2:
+            s = np.argmin(F[(2 * n_samples):(2 * n_samples + n_features)]) + 2 * n_samples
+            theta_old = theta[s]
+            gamma = -F[s] + theta[s]
+            if(gamma < 0):
+                gamma = 0.0
+            theta[s] = gamma
+            beta[s - 2 * n_samples] += (theta[s] - theta_old)
+#Update of the gradient F
+            temp = X[:, s - 2 * n_samples] * (theta[s] - theta_old)
+            F[0:n_samples] -= temp
+            F[n_samples:(2 * n_samples)] +=  temp
+            F[s] += (theta[s] - theta_old)
+            F[-1] +=  - (theta[s] - theta_old)
+        elif case[0] == 3:
+            sigma = -F[-1] / n_features + theta[-1]
+            theta_old = theta[-1]
+            theta[-1] = sigma
+            beta -= np.ones(n_features) * (sigma - theta_old)
+            
+            temp = np.sum(X, axis=1) * (sigma - theta_old)
+            Xtalpha = - X.T @ (theta[0:n_samples] - theta[n_samples:(2 * n_samples)])
+            F[0:n_samples] += temp
+            F[n_samples:(2 * n_samples)] -=  temp
+            F[(2 * n_samples):(2 * n_samples + n_features)] -= np.repeat((theta[-1] - theta_old), n_features)
+            F[-1] += n_features * (theta[-1] - theta_old)
+        sub.append(case)    
+        deltas.append(delta)
+        print('Iteration number', k)
+        print('KKT condition', delta)
+        print('block number', case)
+        k = k + 1
+
+    support = np.arange(0, n_samples)[(theta[0:n_samples] - theta[n_samples:(2 * n_samples)])!=0]
+    support_vectors = X[support,:]
+    dual_coef = theta
+   
+    #return the intercept beta0
+    intercept = None
+    if(k == max_iter):
+        print('did not converge !')
+        
+    return beta, support, support_vectors, dual_coef, intercept, k, sub, deltas
+
 def SMO_nuSVR_constrained(p,Q,X,y,tau,version,C=1,nu=0.5,max_it=1000):
     
 
@@ -55,7 +214,6 @@ def SMO_nuSVR_constrained(p,Q,X,y,tau,version,C=1,nu=0.5,max_it=1000):
     Delta = np.inf # Initialization of the optimality score which has to be lower than tau to stop the iterations
 
     F = np.dot(Q,theta) + p # Initialization of the gradient of the objective function
-    
     
     
     # loop that allows the algorithm to update the variables and converges to the solution of the Simplex NuSVR
@@ -143,10 +301,10 @@ def SMO_nuSVR_constrained(p,Q,X,y,tau,version,C=1,nu=0.5,max_it=1000):
 
         delta.append(Delta)
         k = k + 1
-            
-            
-  
-   
+        print('Iteration number', k)
+        print('KKT condition', delta)
+        print('block number', case)
+
 
     support = np.where((alpha-alpha_star)!=0)
     support_vectors = X[support,:]

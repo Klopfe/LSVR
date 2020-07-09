@@ -2,7 +2,7 @@ import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 import warnings
-from .SMO_constrained import SMO_solver
+from .SMO_constrained import SMO_SSVR
 
 
 class SSVR(BaseEstimator,RegressorMixin):
@@ -16,29 +16,25 @@ class SSVR(BaseEstimator,RegressorMixin):
         self.C=C
         self.tol=tol
         self.max_iter=max_iter
-
+        self.warm_start = None
 
     def fit(self,X,y,version="greedy"):
         X, y=check_X_y(X,y)
   
-        self.support_, self.support_vectors_, self.dual_coef_ , \
-        self.intercept_, self.energie_dual_, self.n_iter_,self.sub_,self.delta_, self.primal_, self.energie_primal_= SMO_solver(X,y,version=version,C=self.C,nu=self.nu,max_it=self.max_iter,precision=self.tol)
+        self.coef_, self.support_, self.support_vectors_, self.dual_coef_ , \
+        self.intercept_, self.n_iter_,self.sub_,self.delta_, = SMO_SSVR(X, y, C=self.C, nu=self.nu, max_iter=self.max_iter, tol=self.tol, warm_start=self.warm_start)
      
         self.is_fitted_=True
         self.shape_fit_=X.shape
         self.training_=X
         self.n_support_=np.size(self.support_)
+        self.warm_start = self.dual_coef_
         return self
 
     def predict(self,X):
         X=check_array(X, accept_sparse=True)
         check_is_fitted(self,'is_fitted_')
-        return np.dot(X,self.coef_())
-
-
-    def coef_(self):
-        coef=self._get_coef()
-        return(coef)
+        return np.dot(X,self.coef_)
 
     def _get_coef(self):
         X=self.training_
